@@ -2,7 +2,7 @@ class Tsm < Formula
   desc "Run several Tailscale tailnets on one Mac at the same time, one daemon per tailnet"
   homepage "https://github.com/igorsigalovs/tailscale-multi"
   url "https://github.com/igorsigalovs/tailscale-multi/releases/download/v0.1.0/tsm-0.1.0.tar.gz"
-  sha256 "f4d5ea36b95e695116e2e0d9b5bfc49f814606294669bda0a528efbd00efd907"
+  sha256 "bf428651336bf209198497ca6afeb88c9f6cde966793a614653b7a143742582e"
   license "MIT"
   head "https://github.com/igorsigalovs/tailscale-multi.git", branch: "main"
 
