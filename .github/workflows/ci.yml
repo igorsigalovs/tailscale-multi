@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install shellcheck bats-core
+      - run: shellcheck bin/tsm install.sh
+      - run: bats test
+      - run: bin/tsm --help >/dev/null && bin/tsm version
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the release tarball and pin the formula to it
+        run: |
+          tag=${GITHUB_REF_NAME}; ver=${tag#v}
+          git archive --format=tar.gz --prefix="tsm-${ver}/" -o "tsm-${ver}.tar.gz" "$tag"
+          sha=$(sha256sum "tsm-${ver}.tar.gz" | cut -d' ' -f1)
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/tsm-${ver}.tar.gz"
+          sed -i "s|url \".*\"|url \"$url\"|; s|sha256 \".*\"|sha256 \"$sha\"|" Formula/tsm.rb
+          git config user.name github-actions; git config user.email actions@github.com
+          git fetch origin main
+          git checkout -B main origin/main
+          git add Formula/tsm.rb
+          git commit -m "formula: ${tag}" || true
+          git push origin main
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: tsm-*.tar.gz
+          generate_release_notes: true

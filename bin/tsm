@@ -1,0 +1,480 @@
+#!/bin/bash
+# tsm — run several independent Tailscale daemons on one Mac, one per tailnet,
+#       all connected at the same time.
+#
+# Commands
+#   tsm list                                   one line per instance: state, address, DNS suffix, peer count
+#   tsm status                                 full `tailscale status` of every instance
+#   tsm add <name> [--login-server URL] [--auth-key KEY]
+#                                              create a daemon (launchd service, survives reboot) and log it in;
+#                                              prints/opens a login URL, or joins silently with a pre-auth key
+#   tsm login <name> [--login-server URL] [--auth-key KEY]
+#                                              (re)authenticate an existing instance, e.g. after key expiry
+#   tsm remove <name>                          log out, stop the service, delete state and routes
+#   tsm sync                                   refresh what the 2-minute background job maintains:
+#                                                - a /32 route per peer to the right utun interface
+#                                                - /etc/hosts block with every peer's MagicDNS + short name
+#                                                - /etc/resolver/<domain> files from each tailnet's split-DNS rules
+#   tsm doctor                                 check daemons, sync job, resolver files and address overlaps
+#   tsm uninstall                              remove every instance, the sync job, routes, hosts and resolver entries
+#   tsm <name> <tailscale args...>             run any tailscale CLI command against one instance,
+#                                              e.g. `tsm work ping gitlab`, `tsm home netcheck`
+#   tsm version | tsm --help
+#
+# Notes
+#   - macOS only. Replaces the Tailscale GUI app (they cannot run at the same time).
+#   - Root is needed for add/remove/sync/uninstall (sudo prompts); list/status/doctor/<name> run as you.
+#   - Each instance is a separate device named <mac-hostname>-<name> in its tailnet.
+#   - Files:
+#       /var/lib/tailscale-multi/<name>/      state
+#       /var/run/tailscale-multi/<name>.sock  control socket
+#       /var/log/tailscale-multi/<name>.log   daemon log
+#       /Library/LaunchDaemons/com.tailscale-multi.<name>.plist     one service per tailnet
+#       /Library/LaunchDaemons/com.tailscale-multi.sync.plist       background sync (every 120 s)
+
+set -euo pipefail
+
+TSM_VERSION="0.1.0"
+
+STATE_ROOT=${TSM_STATE_ROOT:-/var/lib/tailscale-multi}
+SOCK_ROOT=${TSM_SOCK_ROOT:-/var/run/tailscale-multi}
+LOG_ROOT=${TSM_LOG_ROOT:-/var/log/tailscale-multi}
+PLIST_DIR=${TSM_PLIST_DIR:-/Library/LaunchDaemons}
+HOSTS=${TSM_HOSTS:-/etc/hosts}
+RESOLVER_DIR=${TSM_RESOLVER_DIR:-/etc/resolver}
+HOSTS_BEGIN="# BEGIN tailscale-multi (managed by tsm sync)"
+HOSTS_END="# END tailscale-multi"
+RESOLVER_TAG="# managed by tailscale-multi"
+ROUTES_FILE=$STATE_ROOT/managed-routes
+SYNC_LABEL=com.tailscale-multi.sync
+SYNC_INTERVAL=120
+
+OPERATOR="${SUDO_USER:-${USER:-$(id -un)}}"
+if [ "$(id -u)" = 0 ]; then SUDO=""; else SUDO="sudo ${SUDO_FLAGS:-}"; fi
+
+die() { echo "tsm: $*" >&2; exit 1; }
+
+# --- locate tailscale binaries (Homebrew on Apple silicon or Intel, or anything on PATH)
+find_bin() {
+  local b
+  for b in "$(command -v "$1" 2>/dev/null || true)" /opt/homebrew/bin/"$1" /usr/local/bin/"$1"; do
+    [ -n "$b" ] && [ -x "$b" ] && [ ! -L "$b" ] && { echo "$b"; return 0; }
+  done
+  for b in "$(command -v "$1" 2>/dev/null || true)" /opt/homebrew/bin/"$1" /usr/local/bin/"$1"; do
+    [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return 0; }
+  done
+  return 1
+}
+TAILSCALED=${TSM_TAILSCALED:-$(find_bin tailscaled || true)}
+TAILSCALE=${TSM_TAILSCALE:-$(find_bin tailscale || true)}
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
+
+hostname_base() {
+  local h
+  h=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+  echo "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+sock() { echo "$SOCK_ROOT/$1.sock"; }
+label() { echo "com.tailscale-multi.$1"; }
+plist() { echo "$PLIST_DIR/$(label "$1").plist"; }
+tsc() { local name=$1; shift; "$TAILSCALE" --socket="$(sock "$name")" "$@"; }
+
+instances() {
+  local d
+  for d in "$STATE_ROOT"/*/; do [ -d "$d" ] && basename "$d"; done 2>/dev/null || true
+}
+
+require_instance() { [ -d "$STATE_ROOT/$1" ] || die "no instance named '$1' (see: tsm list)"; }
+require_tailscale() {
+  [ -n "$TAILSCALED" ] && [ -n "$TAILSCALE" ] || die "tailscaled/tailscale not found. Install with: brew install tailscale"
+}
+
+wait_socket() {
+  local s; s=$(sock "$1")
+  for _ in $(seq 1 30); do
+    [ -S "$s" ] && "$TAILSCALE" --socket="$s" status --json 2>/dev/null | grep -q BackendState && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- launchd services
+
+write_instance_plist() {
+  local name=$1
+  $SUDO tee "$(plist "$name")" >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(label "$name")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$TAILSCALED</string>
+    <string>--state=$STATE_ROOT/$name/tailscaled.state</string>
+    <string>--socket=$(sock "$name")</string>
+    <string>--tun=utun</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_ROOT/$name.log</string>
+  <key>StandardErrorPath</key><string>$LOG_ROOT/$name.log</string>
+</dict>
+</plist>
+EOF
+  $SUDO chown root:wheel "$(plist "$name")"
+  $SUDO chmod 644 "$(plist "$name")"
+}
+
+# The background sync job always points at THIS copy of tsm, so a brew upgrade
+# (new path) is picked up on the next `tsm add`/`tsm sync`.
+ensure_sync_service() {
+  local p="$PLIST_DIR/$SYNC_LABEL.plist"
+  local want
+  want=$(cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SYNC_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$SELF</string>
+    <string>sync</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>$SYNC_INTERVAL</integer>
+  <key>StandardOutPath</key><string>$LOG_ROOT/sync.log</string>
+  <key>StandardErrorPath</key><string>$LOG_ROOT/sync.log</string>
+</dict>
+</plist>
+EOF
+)
+  if [ -f "$p" ] && [ "$(cat "$p")" = "$want" ]; then return 0; fi
+  $SUDO launchctl bootout "system/$SYNC_LABEL" 2>/dev/null || true
+  echo "$want" | $SUDO tee "$p" >/dev/null
+  $SUDO chown root:wheel "$p"; $SUDO chmod 644 "$p"
+  $SUDO launchctl bootstrap system "$p"
+}
+
+# ---------------------------------------------------------------- login
+
+do_login() {
+  local name=$1; shift
+  local login_server="" auth_key=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --login-server) login_server=$2; shift 2 ;;
+      --login-server=*) login_server=${1#*=}; shift ;;
+      --auth-key) auth_key=$2; shift 2 ;;
+      --auth-key=*) auth_key=${1#*=}; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  local args=(up --accept-routes --accept-dns=false --operator="$OPERATOR" --hostname="$(hostname_base)-$name" --timeout=300s)
+  [ -n "$login_server" ] && args+=(--login-server="$login_server")
+  [ -n "$auth_key" ] && args+=(--auth-key="$auth_key" --force-reauth)
+
+  local out; out=$(mktemp)
+  # first `up` must run as root (operator not set yet); runs in background so we can open the URL
+  $SUDO "$TAILSCALE" --socket="$(sock "$name")" "${args[@]}" >"$out" 2>&1 &
+  local pid=$!
+  local url=""
+  for _ in $(seq 1 60); do
+    url=$(grep -oE 'https?://[^ ]+' "$out" 2>/dev/null | head -1 || true)
+    [ -n "$url" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [ -n "$url" ]; then
+    echo "Login URL for '$name': $url"
+    [ -z "${TSM_NO_OPEN:-}" ] && open "$url" 2>/dev/null || true
+    echo "Waiting for login to complete (up to 5 min)..."
+  fi
+  if ! wait "$pid"; then
+    echo "--- tailscale output ---"; cat "$out"; rm -f "$out"
+    die "login for '$name' did not complete"
+  fi
+  rm -f "$out"
+  tsc "$name" status | head -3
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_add() {
+  require_tailscale
+  local name=${1:-}; [ -n "$name" ] || die "usage: tsm add <name> [--login-server URL] [--auth-key KEY]"; shift
+  [[ "$name" =~ ^[a-z0-9-]+$ ]] || die "name must be lowercase letters, digits, dashes"
+  [ -d "$STATE_ROOT/$name" ] && die "instance '$name' already exists"
+  $SUDO mkdir -p "$STATE_ROOT/$name" "$SOCK_ROOT" "$LOG_ROOT"
+  $SUDO chmod 700 "$STATE_ROOT/$name"
+  write_instance_plist "$name"
+  $SUDO launchctl bootstrap system "$(plist "$name")"
+  wait_socket "$name" || { $SUDO tail -20 "$LOG_ROOT/$name.log"; die "daemon for '$name' did not come up"; }
+  echo "Instance '$name' running."
+  ensure_sync_service
+  do_login "$name" "$@"
+  cmd_sync
+}
+
+cmd_login() {
+  require_tailscale
+  local name=${1:-}; [ -n "$name" ] || die "usage: tsm login <name> [--login-server URL] [--auth-key KEY]"; shift
+  require_instance "$name"
+  do_login "$name" "$@"
+  cmd_sync
+}
+
+remove_instance() {
+  local name=$1
+  tsc "$name" logout 2>/dev/null || true
+  $SUDO launchctl bootout system "$(plist "$name")" 2>/dev/null || true
+  $SUDO rm -f "$(plist "$name")" "$(sock "$name")" "$LOG_ROOT/$name.log"
+  $SUDO rm -rf "${STATE_ROOT:?}/$name"
+}
+
+cmd_remove() {
+  local name=${1:-}; [ -n "$name" ] || die "usage: tsm remove <name>"
+  require_instance "$name"
+  remove_instance "$name"
+  echo "Instance '$name' removed."
+  cmd_sync
+}
+
+cmd_list() {
+  local any=0 name st
+  for name in $(instances); do
+    any=1
+    st="(daemon not reachable)"
+    if [ -S "$(sock "$name")" ]; then
+      st=$(tsc "$name" status --json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin); s=d.get("Self") or {}
+ip=(s.get("TailscaleIPs") or ["-"])[0]
+print("%-12s %-16s %s  peers=%d" % (d.get("BackendState","?"), ip, d.get("MagicDNSSuffix",""), len(d.get("Peer") or {})))
+' 2>/dev/null || echo "(no status)")
+    fi
+    printf "%-12s %s\n" "$name" "$st"
+  done
+  [ $any = 1 ] || echo "no instances (use: tsm add <name>)"
+}
+
+cmd_status() {
+  local name
+  for name in $(instances); do
+    echo "=== $name"
+    tsc "$name" status 2>&1 || true
+    echo
+  done
+}
+
+# ---------------------------------------------------------------- sync: routes, hosts, resolver
+
+# Emits "ip dnsname short iface" per node for every running instance.
+node_table() {
+  local ifmap name
+  ifmap=$(ifconfig | awk '/^utun[0-9]+:/{i=$1; sub(":","",i)} /inet 100\./{print $2, i}')
+  for name in $(instances); do
+    [ -S "$(sock "$name")" ] || continue
+    tsc "$name" status --json 2>/dev/null | IFMAP="$ifmap" python3 -c '
+import json,sys,os
+ifmap=dict(l.split() for l in os.environ["IFMAP"].splitlines() if l.strip())
+d=json.load(sys.stdin)
+self_=d.get("Self") or {}
+selfip=[i for i in (self_.get("TailscaleIPs") or []) if ":" not in i]
+iface=ifmap.get(selfip[0],"") if selfip else ""
+for n in [self_]+list((d.get("Peer") or {}).values()):
+    ips=n.get("TailscaleIPs") or []
+    dn=(n.get("DNSName") or "").rstrip(".")
+    v4=[i for i in ips if ":" not in i]
+    if not v4 or not dn: continue
+    print("%-16s %s %s %s" % (v4[0], dn, dn.split(".")[0], iface))
+' 2>/dev/null
+  done
+}
+
+# Install a /32 route per peer to the interface of the instance that owns it.
+# macOS tailscaled only installs one shared 100.64/10 route, which several
+# daemons fight over; explicit host routes are more specific and always win.
+sync_routes() {
+  local table=$1 want have ip iface
+  want=$(echo "$table" | awk '$4!="" {print $1, $4}' | sort -u)
+  have=$($SUDO cat "$ROUTES_FILE" 2>/dev/null || true)
+  while read -r ip iface; do
+    [ -n "$ip" ] || continue
+    echo "$want" | grep -q "^$ip $iface$" && continue
+    $SUDO route -n delete -host "$ip" >/dev/null 2>&1 || true
+  done <<<"$have"
+  while read -r ip iface; do
+    [ -n "$ip" ] || continue
+    ifconfig "$iface" 2>/dev/null | grep -q "inet $ip " && continue   # own address
+    $SUDO route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1 \
+      || $SUDO route -n change -host "$ip" -interface "$iface" >/dev/null 2>&1 || true
+  done <<<"$want"
+  echo "$want" | $SUDO tee "$ROUTES_FILE" >/dev/null
+}
+
+# Render the managed /etc/hosts block from a node table (pure text; unit-tested).
+render_hosts() {
+  local hosts_in=$1 table=$2
+  awk -v e="$HOSTS_END" 'index($0,"# BEGIN tailscale-multi")==1{skip=1;next} $0==e{skip=0;next} !skip' "$hosts_in"
+  echo "$HOSTS_BEGIN"
+  echo "$table" | awk 'NF {print $1, $2, $3}'
+  echo "$HOSTS_END"
+}
+
+sync_hosts() {
+  local table=$1 tmp
+  tmp=$(mktemp)
+  render_hosts "$HOSTS" "$table" >"$tmp"
+  if ! cmp -s "$tmp" "$HOSTS"; then
+    $SUDO cp "$tmp" "$HOSTS"
+    $SUDO dscacheutil -flushcache 2>/dev/null || true
+    $SUDO killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+  rm -f "$tmp"
+}
+
+# Parse `tailscale dns status` output(s) into "domain nameserver" lines (pure text; unit-tested).
+parse_split_dns() {
+  python3 -c '
+import re,sys
+sect=False
+for line in sys.stdin:
+    if line.startswith("Split DNS Routes:"): sect=True; continue
+    if sect and not line.strip(): sect=False
+    if sect:
+        m=re.match(r"\s*-\s+(\S+?)\.?\s+->\s+(\S+)", line)
+        if m: print(m.group(1), m.group(2))
+'
+}
+
+# Apply each tailnet's split-DNS routes (from its control plane) as /etc/resolver/<domain>
+# files, since --accept-dns is off (several daemons cannot share the system resolver).
+sync_split_dns() {
+  local dump="" name
+  for name in $(instances); do
+    [ -S "$(sock "$name")" ] || continue
+    dump+="$(tsc "$name" dns status 2>/dev/null)"$'\n'
+  done
+  echo "$dump" | parse_split_dns | $SUDO env RESOLVER_DIR="$RESOLVER_DIR" RESOLVER_TAG="$RESOLVER_TAG" python3 -c '
+import os,sys
+d=os.environ["RESOLVER_DIR"]; tag=os.environ["RESOLVER_TAG"]
+want={}
+for line in sys.stdin:
+    p=line.split()
+    if len(p)==2: want.setdefault(p[0], []).append(p[1])
+os.makedirs(d, exist_ok=True)
+for f in os.listdir(d):
+    p=os.path.join(d,f)
+    try: managed = tag in open(p).read()
+    except Exception: managed=False
+    if managed and f not in want: os.remove(p)
+for dom,ns in want.items():
+    body=tag+"\n"+"".join("nameserver %s\n"%n for n in dict.fromkeys(ns))
+    p=os.path.join(d,dom)
+    try: cur=open(p).read()
+    except Exception: cur=None
+    if cur!=body: open(p,"w").write(body)
+'
+}
+
+cmd_sync() {
+  local table; table=$(node_table)
+  sync_routes "$table"
+  sync_hosts "$table"
+  sync_split_dns
+}
+
+# ---------------------------------------------------------------- doctor / uninstall
+
+cmd_doctor() {
+  local ok=1 name
+  say() { printf "  %s %s\n" "$1" "$2"; }
+  echo "tailscale binaries"
+  if [ -n "$TAILSCALED" ]; then say "✓" "tailscaled: $TAILSCALED ($("$TAILSCALED" --version 2>/dev/null | head -1))"; else say "✗" "tailscaled not found (brew install tailscale)"; ok=0; fi
+  if pgrep -fq 'Tailscale.app/Contents/MacOS/Tailscale'; then say "✗" "Tailscale GUI app is running; it fights tsm daemons over routes. Quit it."; ok=0; fi
+
+  echo "instances"
+  local n=0
+  for name in $(instances); do
+    n=$((n+1))
+    if ! [ -S "$(sock "$name")" ]; then say "✗" "$name: socket missing (service down?)  → sudo launchctl bootstrap system $(plist "$name")"; ok=0; continue; fi
+    local st; st=$(tsc "$name" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState","?"))' 2>/dev/null || echo "?")
+    case "$st" in
+      Running) say "✓" "$name: Running" ;;
+      NeedsLogin) say "✗" "$name: needs login  → tsm login $name"; ok=0 ;;
+      *) say "!" "$name: $st"; ok=0 ;;
+    esac
+  done
+  [ $n = 0 ] && say "!" "no instances yet (tsm add <name>)"
+
+  echo "address overlaps (same 100.x address on two tailnets cannot be routed)"
+  local dups
+  dups=$(node_table | awk '{print $1, $4}' | sort -u | awk '{c[$1]++; i[$1]=i[$1] " " $2} END{for(k in c) if(c[k]>1) print k, i[k]}')
+  if [ -n "$dups" ]; then while read -r l; do say "✗" "$l"; done <<<"$dups"; ok=0; else say "✓" "none"; fi
+
+  echo "background sync"
+  if launchctl print "system/$SYNC_LABEL" >/dev/null 2>&1; then
+    local code; code=$(launchctl print "system/$SYNC_LABEL" 2>/dev/null | awk '/last exit code/{print $NF}')
+    if [ "${code:-0}" = "0" ]; then say "✓" "$SYNC_LABEL loaded, last exit 0"; else say "✗" "$SYNC_LABEL last exit code $code (see $LOG_ROOT/sync.log)"; ok=0; fi
+  else
+    say "✗" "$SYNC_LABEL not loaded  → tsm sync (re-creates it)"; ok=0
+  fi
+  local rf; rf=$(find "$RESOLVER_DIR" -mindepth 1 -maxdepth 1 -exec basename {} ';' 2>/dev/null | tr '\n' ' ')
+  say "·" "resolver files: ${rf:-none}"
+  say "·" "managed routes: $($SUDO cat "$ROUTES_FILE" 2>/dev/null | grep -c . || echo 0)"
+
+  if [ $ok = 1 ]; then echo "all good"; else echo "problems found"; return 1; fi
+}
+
+cmd_uninstall() {
+  local name
+  for name in $(instances); do remove_instance "$name"; echo "removed instance $name"; done
+  $SUDO launchctl bootout "system/$SYNC_LABEL" 2>/dev/null || true
+  $SUDO rm -f "$PLIST_DIR/$SYNC_LABEL.plist"
+  # routes
+  while read -r ip _; do [ -n "$ip" ] && $SUDO route -n delete -host "$ip" >/dev/null 2>&1 || true; done < <($SUDO cat "$ROUTES_FILE" 2>/dev/null || true)
+  # hosts block
+  local tmp; tmp=$(mktemp)
+  awk -v e="$HOSTS_END" 'index($0,"# BEGIN tailscale-multi")==1{skip=1;next} $0==e{skip=0;next} !skip' "$HOSTS" >"$tmp"
+  $SUDO cp "$tmp" "$HOSTS"; rm -f "$tmp"
+  # resolver files we own
+  local f
+  for f in "$RESOLVER_DIR"/*; do [ -f "$f" ] && grep -q "$RESOLVER_TAG" "$f" 2>/dev/null && $SUDO rm -f "$f"; done
+  $SUDO rm -rf "$STATE_ROOT" "$SOCK_ROOT" "$LOG_ROOT"
+  $SUDO dscacheutil -flushcache 2>/dev/null || true
+  echo "tailscale-multi removed. (tailscale itself is still installed: brew uninstall tailscale)"
+}
+
+cmd_help() { sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- dispatch
+
+main() {
+  case "${1:-}" in
+    add)       shift; cmd_add "$@" ;;
+    remove)    shift; cmd_remove "$@" ;;
+    list|ls)   cmd_list ;;
+    status)    cmd_status ;;
+    login)     shift; cmd_login "$@" ;;
+    sync|sync-dns) ensure_sync_service 2>/dev/null || true; cmd_sync ;;
+    doctor)    cmd_doctor ;;
+    uninstall) cmd_uninstall ;;
+    version|--version) echo "tsm $TSM_VERSION" ;;
+    ""|-h|--help|help) cmd_help ;;
+    *)
+      require_tailscale
+      local name=$1; shift
+      require_instance "$name"
+      tsc "$name" "$@"
+      ;;
+  esac
+}
+
+# Allow `source bin/tsm` from tests without running anything.
+if [ "${TSM_SOURCED:-}" != "1" ]; then main "$@"; fi
