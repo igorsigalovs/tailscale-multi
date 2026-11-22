@@ -17,13 +17,27 @@
 #                                                - /etc/resolver/<domain> files from each tailnet's split-DNS rules
 #   tsm doctor                                 check daemons, sync job, resolver files and address overlaps
 #   tsm uninstall                              remove every instance, the sync job, routes, hosts and resolver entries
+#   tsm share <name> <port> [--listen PORT] [--write] [--https | --cert FILE --key FILE]
+#                                              let the tailnet <name> reach a service that listens on
+#                                              127.0.0.1:<port> here, at http://<this device>:<port>/.
+#                                              The Host header is rewritten to 127.0.0.1:<port>, so a
+#                                              local-only dev server answers. Read-only by default
+#                                              (GET, HEAD, OPTIONS); --write passes every method and
+#                                              WebSockets and rewrites Origin too. Tailnet only. Plain
+#                                              HTTP by default. --https asks the tailnet for this
+#                                              device's certificate (`tailscale cert`: free on a
+#                                              ts.net tailnet with HTTPS enabled); --cert and --key
+#                                              take a PEM chain and key from elsewhere instead.
+#   tsm share list                             the shares that are running
+#   tsm share stop <name> <port> | --all       stop one share, or all of them
 #   tsm <name> <tailscale args...>             run any tailscale CLI command against one instance,
 #                                              e.g. `tsm work ping gitlab`, `tsm home netcheck`
 #   tsm version | tsm --help
 #
 # Notes
 #   - macOS only. Replaces the Tailscale GUI app (they cannot run at the same time).
-#   - Root is needed for add/remove/sync/uninstall (sudo prompts); list/status/doctor/<name> run as you.
+#   - Root is needed for add/remove/sync/uninstall (sudo prompts); list/status/doctor/share/<name> run as you.
+#   - A share is a background process of yours, not a service: it ends at logout or reboot.
 #   - Each instance is a separate device named <mac-hostname>-<name> in its tailnet.
 #   - Files:
 #       /var/lib/tailscale-multi/<name>/      state
@@ -31,10 +45,11 @@
 #       /var/log/tailscale-multi/<name>.log   daemon log
 #       /Library/LaunchDaemons/com.tailscale-multi.<name>.plist     one service per tailnet
 #       /Library/LaunchDaemons/com.tailscale-multi.sync.plist       background sync (every 120 s)
+#       ~/.local/state/tsm/shares/            pid and log of every share (`tsm share`)
 
 set -euo pipefail
 
-TSM_VERSION="0.1.0"
+TSM_VERSION="0.2.0"
 
 STATE_ROOT=${TSM_STATE_ROOT:-/var/lib/tailscale-multi}
 SOCK_ROOT=${TSM_SOCK_ROOT:-/var/run/tailscale-multi}
@@ -46,6 +61,7 @@ HOSTS_BEGIN="# BEGIN tailscale-multi (managed by tsm sync)"
 HOSTS_END="# END tailscale-multi"
 RESOLVER_TAG="# managed by tailscale-multi"
 ROUTES_FILE=$STATE_ROOT/managed-routes
+SHARE_ROOT=${TSM_SHARE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/tsm/shares}
 SYNC_LABEL=com.tailscale-multi.sync
 SYNC_INTERVAL=120
 
@@ -451,6 +467,296 @@ cmd_uninstall() {
   echo "tailscale-multi removed. (tailscale itself is still installed: brew uninstall tailscale)"
 }
 
+# ---------------------------------------------------------------- share
+
+# The proxy behind `tsm share`: listens on one address, forwards to 127.0.0.1:<port> and names
+# the upstream as itself (Host, and with --write also Origin and Referer), so a server that only
+# answers to its loopback name answers. Standard library only.
+share_proxy_py() {
+  cat <<'PY'
+import http.client, http.server, os, select, socket, ssl, sys, threading
+
+bind, listen, port, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+cert, key = (sys.argv[5], sys.argv[6]) if len(sys.argv) > 6 else (None, None)
+WRITE = mode == "write"
+LOCAL = "127.0.0.1:%d" % port
+SCHEME = "https" if cert else "http"
+READ_ONLY = ("GET", "HEAD", "OPTIONS")
+HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+       "transfer-encoding", "upgrade", "proxy-connection"}
+
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "tsm-share"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    def refuse(self, status, text):
+        body = (text + "\n").encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+
+    def upstream_headers(self):
+        out = []
+        for name, value in self.headers.items():
+            low = name.lower()
+            if low in HOP or low == "host":
+                continue
+            if low in ("origin", "referer"):
+                if not WRITE:
+                    continue
+                public = "%s://%s" % (SCHEME, self.headers.get("Host", ""))
+                value = value.replace(public, "http://" + LOCAL)
+            out.append((name, value))
+        out.append(("Host", LOCAL))
+        return out
+
+    def handle_any(self):
+        upgrade = "upgrade" in self.headers.get("Connection", "").lower()
+        if not WRITE and (self.command not in READ_ONLY or upgrade):
+            return self.refuse(405, "tsm share: this share is read-only (start it with --write to pass %s)"
+                               % ("WebSockets" if upgrade else self.command))
+        if upgrade:
+            return self.tunnel()
+        length = self.headers.get("Content-Length")
+        if length is None and "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return self.refuse(411, "tsm share: a request body needs a Content-Length")
+        body = self.rfile.read(int(length)) if length else None
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=None)
+        try:
+            conn.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            for name, value in self.upstream_headers():
+                conn.putheader(name, value)
+            conn.endheaders(body)
+            reply = conn.getresponse()
+        except OSError as error:
+            conn.close()
+            return self.refuse(502, "tsm share: nothing answers on %s (%s)" % (LOCAL, error))
+        try:
+            self.relay(reply)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        finally:
+            conn.close()
+
+    def relay(self, reply):
+        self.send_response(reply.status, reply.reason)
+        sized = reply.getheader("Content-Length")
+        for name, value in reply.getheaders():
+            low = name.lower()
+            if low in HOP or low == "content-length":
+                continue
+            if low == "location":
+                value = value.replace("http://" + LOCAL, "%s://%s" % (SCHEME, self.headers.get("Host", LOCAL)))
+            self.send_header(name, value)
+        bodiless = self.command == "HEAD" or reply.status in (204, 304) or 100 <= reply.status < 200
+        if sized is not None:
+            self.send_header("Content-Length", sized)
+        elif not bodiless:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        if bodiless:
+            return
+        # read1 hands over what has arrived, so an event stream reaches the reader as it is written.
+        while True:
+            chunk = reply.read1(65536)
+            if not chunk:
+                break
+            if sized is None:
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            else:
+                self.wfile.write(chunk)
+            self.wfile.flush()
+        if sized is None:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    def tunnel(self):
+        try:
+            up = socket.create_connection(("127.0.0.1", port))
+        except OSError as error:
+            return self.refuse(502, "tsm share: nothing answers on %s (%s)" % (LOCAL, error))
+        head = ["%s %s HTTP/1.1" % (self.command, self.path)]
+        head += ["%s: %s" % pair for pair in self.upstream_headers()]
+        head += ["Connection: Upgrade", "Upgrade: %s" % self.headers.get("Upgrade", "websocket"), "", ""]
+        up.sendall("\r\n".join(head).encode("latin-1"))
+        self.close_connection = True
+        client = self.connection
+        try:
+            while True:
+                ready, _, _ = select.select([client, up], [], [])
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    (up if source is client else client).sendall(data)
+        except OSError:
+            pass
+        finally:
+            up.close()
+
+    do_GET = do_HEAD = do_OPTIONS = do_POST = do_PUT = do_PATCH = do_DELETE = handle_any
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    address_family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+
+
+server = Server((bind, listen), Proxy)
+if cert:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+sys.stderr.write("tsm share: %s://%s:%d -> %s (%s)\n" % (SCHEME, bind, listen, LOCAL, mode))
+sys.stderr.flush()
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    threading.Event().wait()
+except KeyboardInterrupt:
+    pass
+PY
+}
+
+share_file() { echo "$SHARE_ROOT/$1-$2.$3"; }
+
+# pid of a running share, or nothing.
+share_pid() {
+  local file pid
+  file=$(share_file "$1" "$2" pid)
+  [ -f "$file" ] || return 1
+  pid=$(cat "$file" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$pid"; return 0; }
+  return 1
+}
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# Whether something accepts connections on address $1, port $2.
+port_answers() {
+  python3 -c 'import socket,sys
+s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET); s.settimeout(1)
+sys.exit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)' "$1" "$2" 2>/dev/null
+}
+
+share_start() {
+  local name=${1:-} port=${2:-}
+  [ -n "$name" ] && [ -n "$port" ] || die "usage: tsm share <name> <port> [--listen PORT] [--write] [--https | --cert FILE --key FILE]"
+  shift 2
+  local listen=$port mode="read" cert="" key="" https=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --listen) listen=${2:-}; shift 2 ;;
+      --write)  mode="write"; shift ;;
+      --https)  https=1; shift ;;
+      --cert)   cert=${2:-}; shift 2 ;;
+      --key)    key=${2:-}; shift 2 ;;
+      *) die "unknown option for share: $1" ;;
+    esac
+  done
+  valid_port "$port" || die "the port must be a number from 1 to 65535, got '$port'"
+  valid_port "$listen" || die "the --listen port must be a number from 1 to 65535, got '$listen'"
+  if [ -n "$cert" ] || [ -n "$key" ]; then
+    [ "$https" = 0 ] || die "use either --https or --cert with --key, not both"
+    [ -f "$cert" ] && [ -f "$key" ] || die "--cert and --key each need a readable file"
+  fi
+  require_tailscale
+  require_instance "$name"
+
+  local bind=${TSM_SHARE_BIND:-}
+  [ -n "$bind" ] || bind=$(tsc "$name" ip -4 2>/dev/null | head -1 || true)
+  [ -n "$bind" ] || die "'$name' has no tailnet address yet (see: tsm list)"
+  local host
+  host=$(tsc "$name" status --json 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))
+except Exception: pass' 2>/dev/null || true)
+  [ -n "$host" ] || host=$bind
+
+  mkdir -p "$SHARE_ROOT"
+  if share_pid "$name" "$listen" >/dev/null; then
+    die "'$name' already shares port $listen (tsm share stop $name $listen)"
+  fi
+  if [ "$https" = 1 ]; then
+    cert=$(share_file "$name" "$listen" crt); key=$(share_file "$name" "$listen" key)
+    tsc "$name" cert --cert-file "$cert" --key-file "$key" "$host" >/dev/null 2>"$cert.err" \
+      || die "the tailnet '$name' issued no certificate for $host: $(tr '\n' ' ' <"$cert.err")
+(on a ts.net tailnet, enable HTTPS Certificates in the admin console; otherwise pass --cert and --key)"
+    rm -f "$cert.err"; chmod 600 "$key"
+  fi
+  port_answers 127.0.0.1 "$port" || echo "tsm: note: nothing answers on 127.0.0.1:$port yet" >&2
+
+  local py log pidfile
+  py=$SHARE_ROOT/share-proxy.py; log=$(share_file "$name" "$listen" log); pidfile=$(share_file "$name" "$listen" pid)
+  share_proxy_py >"$py"
+  if [ -n "$cert" ]; then
+    nohup python3 "$py" "$bind" "$listen" "$port" "$mode" "$cert" "$key" >"$log" 2>&1 &
+  else
+    nohup python3 "$py" "$bind" "$listen" "$port" "$mode" >"$log" 2>&1 &
+  fi
+  local pid=$!
+  echo "$pid" >"$pidfile"
+  # Wait for the listener, or for the process to end (address in use, bad certificate).
+  until port_answers "$bind" "$listen"; do
+    kill -0 "$pid" 2>/dev/null || { rm -f "$pidfile"; die "the share did not start: $(tail -1 "$log" 2>/dev/null)"; }
+  done
+  local scheme=http; [ -z "$cert" ] || scheme=https
+  echo "$scheme://$host:$listen/  ->  127.0.0.1:$port   ($([ "$mode" = write ] && echo "every method" || echo "read-only"), tailnet $name)"
+  [ "$host" = "$bind" ] || [ -n "$cert" ] || echo "$scheme://$bind:$listen/"
+  echo "stop it with: tsm share stop $name $listen"
+}
+
+share_list() {
+  local file base pid any=0
+  for file in "$SHARE_ROOT"/*.pid; do
+    [ -f "$file" ] || continue
+    base=$(basename "$file" .pid)
+    if pid=$(share_pid "${base%-*}" "${base##*-}"); then
+      printf '%-12s port %-6s pid %-7s %s\n' "${base%-*}" "${base##*-}" "$pid" "$(head -1 "$SHARE_ROOT/$base.log" 2>/dev/null | sed 's/^tsm share: //')"
+      any=1
+    else
+      rm -f "$file"
+    fi
+  done
+  [ "$any" = 1 ] || echo "no shares"
+}
+
+share_stop() {
+  local file base pid
+  if [ "${1:-}" = "--all" ]; then
+    for file in "$SHARE_ROOT"/*.pid; do
+      [ -f "$file" ] || continue
+      base=$(basename "$file" .pid)
+      share_stop "${base%-*}" "${base##*-}"
+    done
+    return 0
+  fi
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || die "usage: tsm share stop <name> <port> | --all"
+  if pid=$(share_pid "$1" "$2"); then
+    kill "$pid" 2>/dev/null || true
+    echo "stopped the share of port $2 on $1"
+  else
+    echo "no share of port $2 on $1"
+  fi
+  rm -f "$(share_file "$1" "$2" pid)" "$(share_file "$1" "$2" crt)" "$(share_file "$1" "$2" key)"
+}
+
+cmd_share() {
+  case "${1:-}" in
+    list|ls)  share_list ;;
+    stop|off) shift; share_stop "$@" ;;
+    *)        share_start "$@" ;;
+  esac
+}
+
 cmd_help() { sed -n '2,/^$/p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------- dispatch
@@ -464,6 +770,7 @@ main() {
     login)     shift; cmd_login "$@" ;;
     sync|sync-dns) ensure_sync_service 2>/dev/null || true; cmd_sync ;;
     doctor)    cmd_doctor ;;
+    share)     shift; cmd_share "$@" ;;
     uninstall) cmd_uninstall ;;
     version|--version) echo "tsm $TSM_VERSION" ;;
     ""|-h|--help|help) cmd_help ;;

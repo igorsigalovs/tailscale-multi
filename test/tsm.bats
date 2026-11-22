@@ -59,7 +59,7 @@ EOF
 
 @test "help lists every command" {
   run cmd_help
-  for c in "tsm list" "tsm status" "tsm add" "tsm login" "tsm remove" "tsm sync" "tsm doctor" "tsm uninstall"; do
+  for c in "tsm list" "tsm status" "tsm add" "tsm login" "tsm remove" "tsm sync" "tsm doctor" "tsm share" "tsm uninstall"; do
     [[ "$output" == *"$c"* ]]
   done
 }
@@ -68,4 +68,120 @@ EOF
   run cmd_add "Bad Name"
   [ "$status" -ne 0 ]
   [[ "$output" == *"lowercase"* ]]
+}
+
+# --- tsm share: the proxy against a throw-away upstream on the loopback (no tailscale needed).
+
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+
+# An upstream like a local-only dev server: answers only when it is named 127.0.0.1:<its port>,
+# echoes the method, and takes a write only from its own origin.
+start_upstream() {
+  UP=$(free_port)
+  python3 - "$UP" >/dev/null 2>&1 <<'PY' &
+import http.server, sys
+port = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def reply(self):
+        if self.headers.get("Host") != "127.0.0.1:%d" % port:
+            self.send_response(403); self.end_headers(); return
+        if self.command == "POST" and self.headers.get("Origin") != "http://127.0.0.1:%d" % port:
+            self.send_response(403); self.end_headers(); return
+        if self.path == "/go":
+            self.send_response(302); self.send_header("Location", "http://127.0.0.1:%d/there" % port)
+            self.send_header("Content-Length", "0"); self.end_headers(); return
+        body = ("%s %s" % (self.command, self.path)).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    do_GET = do_POST = reply
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+  UP_PID=$!
+  disown "$UP_PID"
+  until port_answers 127.0.0.1 "$UP"; do kill -0 "$UP_PID"; done
+}
+
+share_setup() {
+  export TSM_STATE_ROOT="$TMP/state" TSM_SHARE_ROOT="$TMP/shares" TSM_SHARE_BIND=127.0.0.1
+  STATE_ROOT=$TSM_STATE_ROOT; SHARE_ROOT=$TSM_SHARE_ROOT
+  mkdir -p "$STATE_ROOT/lab"
+  start_upstream
+  LISTEN=$(free_port)
+}
+
+share_teardown() { share_stop --all >/dev/null 2>&1 || true; kill "$UP_PID" 2>/dev/null || true; }
+
+@test "share: the upstream refuses its tailnet name, and answers through the share" {
+  share_setup
+  run curl -s -o /dev/null -w '%{http_code}' -H 'Host: mac-lab.example:1' "http://127.0.0.1:$UP/"
+  [ "$output" = "403" ]
+  run share_start lab "$UP" --listen "$LISTEN"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"read-only"* ]]
+  run curl -s -H 'Host: mac-lab.example:1' "http://127.0.0.1:$LISTEN/page?x=1"
+  [ "$output" = "GET /page?x=1" ]
+  share_teardown
+}
+
+@test "share: read-only refuses a write, and --write passes it with the local origin" {
+  share_setup
+  share_start lab "$UP" --listen "$LISTEN" >/dev/null
+  run curl -s -o /dev/null -w '%{http_code}' -X POST -d a=1 "http://127.0.0.1:$LISTEN/save"
+  [ "$output" = "405" ]
+  share_stop lab "$LISTEN" >/dev/null
+  share_start lab "$UP" --listen "$LISTEN" --write >/dev/null
+  run curl -s -X POST -d a=1 -H "Origin: http://127.0.0.1:$LISTEN" "http://127.0.0.1:$LISTEN/save"
+  [ "$output" = "POST /save" ]
+  share_teardown
+}
+
+@test "share: a redirect to the local name comes back under the shared name" {
+  share_setup
+  share_start lab "$UP" --listen "$LISTEN" >/dev/null
+  run curl -s -o /dev/null -w '%{redirect_url}' "http://127.0.0.1:$LISTEN/go"
+  [ "$output" = "http://127.0.0.1:$LISTEN/there" ]
+  share_teardown
+}
+
+@test "share: list shows a running share, stop ends it, a second start on the port is refused" {
+  share_setup
+  share_start lab "$UP" --listen "$LISTEN" >/dev/null
+  run share_list
+  [[ "$output" == *"lab"*"port $LISTEN"* ]]
+  run share_start lab "$UP" --listen "$LISTEN"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already shares"* ]]
+  run share_stop lab "$LISTEN"
+  [[ "$output" == *"stopped"* ]]
+  run share_list
+  [ "$output" = "no shares" ]
+  share_teardown
+}
+
+@test "share: bad input is refused before anything starts" {
+  share_setup
+  run share_start lab notaport
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"1 to 65535"* ]]
+  run share_start nosuch "$UP"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no instance named"* ]]
+  run share_start lab "$UP" --https --cert a --key b
+  [ "$status" -ne 0 ]
+  run share_list
+  [ "$output" = "no shares" ]
+  share_teardown
+}
+
+@test "share: --cert and --key serve the share over https" {
+  share_setup
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+    -keyout "$TMP/key.pem" -out "$TMP/cert.pem" >/dev/null 2>&1
+  run share_start lab "$UP" --listen "$LISTEN" --cert "$TMP/cert.pem" --key "$TMP/key.pem"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"https://"* ]]
+  run curl -sk "https://127.0.0.1:$LISTEN/secure"
+  [ "$output" = "GET /secure" ]
+  share_teardown
 }

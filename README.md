@@ -43,11 +43,40 @@ tsm work ping db-1             # any tailscale command, per instance
 tsm login work                 # re-authenticate after key expiry
 tsm remove client              # leave one tailnet
 tsm doctor                     # health check
+tsm share work 3000            # let the work tailnet open http://<this-mac>-work:3000 (see below)
 tsm uninstall                  # remove everything tsm created
 ```
 
 Each instance is a separate device named `<your-mac>-<name>` in that tailnet. Node keys expire per
 the tailnet's policy; `tsm doctor` tells you when one needs `tsm login`.
+
+## Share a local port with a tailnet
+
+```sh
+tsm share work 3000            # http://<this-mac>-work.<tailnet>:3000/ -> 127.0.0.1:3000, read-only
+tsm share work 3000 --write    # every method and WebSockets too
+tsm share work 3000 --listen 8443 --cert chain.pem --key key.pem   # https with your own certificate
+tsm share work 3000 --https    # https with the tailnet's own certificate (`tailscale cert`)
+tsm share list
+tsm share stop work 3000       # or: tsm share stop --all
+```
+
+A dev server usually listens on `127.0.0.1` only, and many refuse a request that names them by anything
+but `localhost` (a guard against DNS rebinding). `tsm share` runs a small proxy on this device's address
+in that one tailnet and names the server as `127.0.0.1:<port>` towards it, so the page answers for the
+other devices of the tailnet and for nobody else: it does not listen on your LAN or on the internet.
+
+- **Read-only by default.** Only `GET`, `HEAD` and `OPTIONS` pass; anything else, and a WebSocket, gets
+  `405`. `--write` passes everything and also rewrites `Origin` and `Referer` to the local name. That
+  lifts the server's own local-only write guard for the whole tailnet, so use it on purpose.
+- **Plain HTTP unless you bring a certificate.** Traffic inside a tailnet is already encrypted by
+  WireGuard; HTTPS matters when the page needs a secure context or you want no browser warning.
+  `--https` asks the tailnet for this device's certificate, which works on a Tailscale-hosted (`ts.net`)
+  tailnet with HTTPS Certificates enabled and not on Headscale. `--cert`/`--key` take any PEM chain and
+  key, for example one issued by Let's Encrypt through a DNS challenge for a name that points at this
+  device's tailnet address.
+- A share is a background process of yours, not a service: it ends at logout or reboot. Its pid and log
+  are in `~/.local/state/tsm/shares/`.
 
 ## What it does under the hood
 
@@ -85,7 +114,8 @@ bats test
 ```
 
 The sync logic is split into pure text functions (`render_hosts`, `parse_split_dns`) that the tests
-exercise without root or a running tailscale.
+exercise without root or a running tailscale. The `share` tests run the proxy on the loopback
+against a throw-away upstream.
 
 ## License
 
